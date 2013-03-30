@@ -11,4 +11,10 @@ Upon hitting the wps button (red button) on the asus n16, the router shuts down 
 I haven't found any proper shutdown scripts on the internet, so decided to roll my own. Hope you find this helpful.
 If you aren't using the asus n16 router, you might need to change some gpio button constants in led.sh
 
+To install:
+	run stripMountComments.py to generate the startup script and put it in nvram, or go to Administration > Commands > Startup in the web ui
+	after rebooting:
+	$ mkdir /opt/jffs/etc/
+	copy everything in ./config to /opt/jffs/etc/config
+
 Tested on basmaf optware take 2, DD-WRT v24-sp2 (09/22/12) mega (SVN revision 20006)
