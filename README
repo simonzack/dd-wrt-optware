@@ -1,7 +1,13 @@
 
 This is a set of helper scripts for dd-wrt optware
 
+The default usb automount buggy, usb.startup mounts /opt and /mnt automatically
+	You might need to change the partition numbers
+
 Upon hitting the wps button (red button) on the asus n16, the router shuts down optware if the button is pressed once, reboot if twice, and cancels if pressed 3 times
+	/opt and /mnt are unmounted on shutdown
+	if this fails the power light will stay on, otherwise it will turn off
+
 I haven't found any proper shutdown scripts on the internet, so decided to roll my own. Hope you find this helpful.
 If you aren't using the asus n16 router, you might need to change some gpio button constants in led.sh
 
