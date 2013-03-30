@@ -1,0 +1,157 @@
+#!/opt/bin/bash
+
+##
+#Customizes the action of the red WPS button on Asus RT-N16 (and possibly other routers running DD-WRT)
+#Flashes Power LED to give feedback
+##
+
+#this works by having a daemon (a process which starts up on the initial button presses, then receives button press signals from works),
+#	and workers (processes which detects button presses)
+
+set -o nounset
+set -o errexit
+
+#/opt/bin isn't in the default environment
+export PATH=/opt/bin:/opt/sbin:/opt/usr/sbin:$PATH
+
+#how many times the led is flashed on each feedback
+#	read in argument 1, substitute (':-') it by 1 if it doesn't exist; the piped command removes all non integer chars
+arg_count=$(echo ${1:-1} | tr -dc '[0-9]')
+
+#http://stackoverflow.com/questions/59895/can-a-bash-script-tell-what-directory-its-stored-in
+curDir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd $curDir
+
+. /jffs/etc/config/lib/event.sh
+. /jffs/etc/config/lib/led.sh
+
+#temporary nvram variables (not committed to flash)
+WPS_ACTIVE=WPS_ACTIVE
+WPS_COUNT=WPS_COUNT
+WPS_EVENT=WPS_EVENT
+
+#don't use nvram for locks, use flock instead
+#	flock automatically unlocks on script exit, so don't need to catch this with traps
+#clicks should always register, so do not exit the script if the lock can't be acquired
+LOCK_FIRST_PATH="/tmp/WPS_ACTIVE.LCK"
+LOCK_COUNT_PATH="/tmp/WPS_COUNT.LCK"
+
+#bash 3 doesn't support variable redirection
+LOCK_FIRST=3	#ensure only one script is the "deamon"
+LOCK_COUNT=4	#ensure WPS_COUNT has atomic writes
+
+#create lock files, note that flock will automatically release the lock on exit
+eval "exec $LOCK_FIRST> $LOCK_FIRST_PATH"
+eval "exec $LOCK_COUNT> $LOCK_COUNT_PATH"
+
+#wps button is also the reset nvram button, so don't determine the input by how long it is pressed
+#check the number of button "clicks" at most $CLICK_MAX times with $CLICK_INTERVAL seconds timeouts
+#sleeps $CLICK_FINAL_INTERVAL seconds if $CLICK_MAX is reached so it's easier to see the feedback
+CLICK_MAX=3
+CLICK_INTERVAL=3
+CLICK_FINAL_INTERVAL=1
+
+#feedback parameters
+LED_FLASHES=1
+LED_OFF=120000
+LED_ON=100000
+
+log="logger -p local0.notice -t wps.sesbutton $$ "
+
+run_worker() {
+	trap 'exit 3' INT TERM EXIT
+	$log "next button press detected"
+	flock -x $LOCK_COUNT
+		#exit if button press detection has finished
+		cur_count=$(nvram get $WPS_COUNT)
+		if ! [[ $cur_count ]]; then
+			$log "daemon's finished processing button presses, ignoring button press"
+			exit 1
+		fi
+		if (( $cur_count >= $CLICK_MAX )); then
+			$log "max amount of button presses already received"
+			exit 1
+		fi
+		flash_led $arg_count $LED_OFF $LED_ON &
+		nvram set $WPS_COUNT=$(($cur_count+1))
+		#use nvram here to know that it's actually set
+		$log "current $WPS_COUNT=$(nvram get $WPS_COUNT)"
+		event_signal $WPS_EVENT || true
+	flock -u $LOCK_COUNT
+	trap - INT TERM EXIT
+	exit 1
+}
+
+if [[ "$(nvram get $WPS_ACTIVE)" ]]; then
+	#daemon's active, send button press
+	run_worker
+fi
+
+#make sure only one daemon is active at a time
+#wait if another daemon is already trying to startup
+flock -x $LOCK_FIRST
+	#our turn to try and start the daemon, check if the other process was successful if we are not the first to acquire the lock
+	if [[ "$(nvram get $WPS_ACTIVE)" ]]; then
+		run_worker
+	else
+		#start the daemon
+		#clear vars on sudden exit
+		trap "nvram unset $WPS_COUNT; nvram unset $WPS_ACTIVE; event_wait_cleanup $WPS_EVENT; exit 2" INT TERM EXIT
+		#button hasn't been pressed before, initialize vars
+		$log "first button press detected"
+		flash_led $arg_count $LED_OFF $LED_ON &
+		nvram set $WPS_ACTIVE=1
+		nvram set $WPS_COUNT=1
+		$log "current $WPS_COUNT=$(nvram get $WPS_COUNT)"
+	fi
+flock -u $LOCK_FIRST
+
+#start receiving button presses, starting at 1 since we've already received a button press
+old_count=1
+while true; do
+	event_wait $CLICK_INTERVAL $WPS_EVENT || true
+	cur_count=$(nvram get $WPS_COUNT)
+	if (( $cur_count > $old_count )); then
+		$log 'button press(es) received'
+		if (( $cur_count < $CLICK_MAX )); then
+			old_count=$cur_count
+			continue
+		else
+			sleep $CLICK_FINAL_INTERVAL
+		fi
+	fi
+	break
+done
+
+$log "final $WPS_COUNT=$cur_count"
+
+flock -x $LOCK_COUNT
+	nvram unset $WPS_COUNT
+flock -u $LOCK_COUNT
+
+#see how many times the led's have flashed
+flash_led $cur_count $LED_OFF $LED_ON &
+sleep $CLICK_FINAL_INTERVAL
+
+#if lights are too bright on the router at night, better to use something to cover it,
+#	since only turning off the power light works
+
+#don't wait for sync so the daemon can exit and the next daemon can start as soon as possible
+#replace the subshell with 'exec' after waiting for sync so the daemon exits completely
+case $cur_count in
+	"1") $log "running command: shutdown"
+		( sync; exec /opt/jffs/etc/config/shutdown/shutdown.sh) &
+		;;
+	"2") $log "running command: reboot (/sbin/reboot)"
+		( sync; exec /sbin/reboot) &
+		;;
+	"3") $log "running command: nop (cancel previous clicks)"
+		;;
+esac
+
+#unset WPS_ACTIVE late as the daemon should only be restarted once it's finished
+nvram unset $WPS_ACTIVE
+
+trap - INT TERM EXIT
+
+exit 0
