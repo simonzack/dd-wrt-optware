@@ -1,9 +1,17 @@
-#!/opt/bin/bash
+#!/bin/sh
+
+#jffs remount wrapper to the main shutdown script, so the main shutdown script can run without interruption
+
+#note that during testing the console might correctly show that the script has exited, even when it has
 
 #to test:
-#	the shutdown script should not start in /jffs, as it's unmounted by automount
+#	start in /opt as /jffs is unmounted first
 #	$ cd /
 #	$ exec /bin/sh
+#	$ /opt/jffs/etc/config/shutdown/shutdown.sh
+
+#to test for error handling when opt unmounting fails:
+#	$ cd /opt
 #	$ /opt/jffs/etc/config/shutdown/shutdown.sh
 
 export PATH=/opt/bin:/opt/sbin:/opt/usr/sbin:$PATH
@@ -12,90 +20,124 @@ export PATH=/opt/bin:/opt/sbin:/opt/usr/sbin:$PATH
 LOCK_PATH="/tmp/SHUTDOWN.LCK"
 LOCK_FILE=3
 eval "exec $LOCK_FILE> $LOCK_PATH"
-SHUTDOWN_EVENT="SHUTDOWN_EVENT"
-
-#feedback parameters, don't export as there can be name collisions
-LED_OFF=40000
-LED_ON=40000
-
-#maximum wait time for optware shutdown
-MAX_WAIT_INTERVAL=-1
+SHUTDOWN_STAGE="SHUTDOWN_STAGE"
+SHUTDOWN_RES="SHUTDOWN_RES"
 
 #mount /tmp to /jffs on startup:
 #	the final unmount script & background processes during it's execution should have no handles to mounted partitions,
-#	but as there are library dependencies, and the import paths cannot change, we need to copy imported scripts to /tmp, and remount a partition if the paths are absolute
-#		(if the import paths are relative then remounting is not required, e.g. if we import from the script's path)
-#	the final unmount script & background processes can then only use the copied scripts (for imports)
-#	we can't use & remount /opt for absolute import paths, since services require it to be stopped, hence we remount /jffs
-#	we do this on startup instead of just before switching shells, since automount unmounts /jffs
+#	but as there are library dependencies at all stages, and the import paths cannot change, we need to copy imported scripts to /tmp, and remount a partition
+#	relative paths (calculating the path to use by checking what is mounted) makes this easier, as a script can be run before or after remounting without modification
+#	process:
+#		use import scripts on partition #1
+#		unmount partition #2, and remount it in /tmp
+#		close unmount script (seperate script so we can close it's imports too)
+#		use import scripts on /tmp
+#		unmount partition #1
+#	if we remount /jffs:
+#		we remount on startup instead of just before switching shells, since automount unmounts /jffs if it's not on ramfs
 #		(automount only unmounts hdd partitions, not ramfs, so it won't unmount what we have just mounted)
-#change current dir so jffs can be unmounted
-cd /
-/opt/jffs/etc/config/shutdown/tmp_jffs.sh || exit 1
-. /jffs/etc/config/lib/event.sh
-. /jffs/etc/config/lib/mount.sh
-. /jffs/etc/config/shutdown/shutdown_helpers.sh
+#	if we remount /opt:
+#		we have to remount after running optK, as service scripts require /opt when running 'service ... stop'
 
-function shutdown_optware_signal(){
-	/opt/etc/init.d/optK
-	event_signal $SHUTDOWN_EVENT || true
+remount_jffs_tmp_wait(){
+	if ! unmount_wait 2 1 /jffs; then
+		shutdown_log_unmount_fail /jffs
+		return 1
+	fi
+	#copy the scripts required for shutdown to /tmp, so no handles to /opt or /jffs are kept
+	tmp_jffs_init_shutdown
 }
 
-function shutdown_unmount(){
-	if ! is_mounted '/opt'; then
+remount_jffs_tmp(){
+	. /opt/jffs/etc/config/lib/mount.sh
+	. /opt/jffs/etc/config/shutdown/jffs_helpers.sh
+	. /opt/jffs/etc/config/shutdown/shutdown_helpers.sh
+	shutdown_log "remounting jffs to tmp"
+	remount_jffs_tmp_wait
+	local res=$?
+	if [ $res = 0 ]; then
+		/jffs/etc/config/shutdown/shutdown.sh &
+	else
+		shutdown_log "failed to remount jffs"
+		return $res
+	fi
+}
+
+unmount_opt(){
+	. /jffs/etc/config/lib/led.sh
+	. /jffs/etc/config/shutdown/jffs_helpers.sh
+	. /jffs/etc/config/shutdown/shutdown_helpers.sh
+	/jffs/etc/config/shutdown/opt.sh
+	local res=$?
+	#clean jffs tmp to save ram
+	tmp_jffs_close
+	if [ $res = 0 ]; then
+		#commit nvram on successful shutdown
+		nvram commit
+		#nvram commit turns the power led back on
+		led_off
+		return $res
+	else
+		#switch paths so we can remount jffs
+		#store exit code of unmount reason for failure
+		nvram set $SHUTDOWN_RES=$res
+		/opt/jffs/etc/config/shutdown/shutdown.sh &
+	fi
+}
+
+remount_jffs_opt(){
+	. /opt/jffs/etc/config/shutdown/jffs_helpers.sh
+	. /opt/jffs/etc/config/shutdown/shutdown_helpers.sh
+	local res=$(nvram get $SHUTDOWN_RES)
+	nvram unset $SHUTDOWN_RES
+	#remount jffs so shutdown can be performed again using the wps button
+	shutdown_log "remounting jffs to opt"
+	jffs_mount_opt
+	#always return to the first stage, as we remount jffs to tmp again
+	nvram unset $SHUTDOWN_STAGE
+	return $res
+}
+
+shutdown_main(){
+	#no traps needed
+	cd /
+	#don't use nvram or tmp to store the stage of shutdown, to be safer in cases with unusual mount points, and so some stages can run independently
+	#	(e.g. when /jffs is unmounted but /opt is, or when debugging the shutdown script)
+	local scriptDir=$(dirname $(readlink -f $0))
+	. "${scriptDir}/../lib/mount.sh" || return
+	if is_mounted /jffs && is_mounted /opt; then
+		if [ $(mount_path /jffs) = "/tmp" ] || [ $(mount_path /jffs) = "/jffs" ]; then
+			if ! [ $(nvram get $SHUTDOWN_RES) ]; then
+				unmount_opt
+				return $?
+			else
+				#unmounting opt has failed, remount jffs
+				remount_jffs_opt
+				return $?
+			fi
+		else
+			#remount jffs to opt to prepare for unmounting opt
+			remount_jffs_tmp
+			return $?
+		fi
+	elif is_mounted /jffs; then
+		shutdown_log "error: jffs is mounted but opt is not"
+		return 1
+	elif is_mounted /opt; then
+		remount_jffs_opt
+		return $?
+	else
 		return
 	fi
-	#kill mypage's process group (there's no service stop)
-	#	use while instead of for .. in, due to some mypage processes being started by other ones, and kill might kill all of them
-	shutdown_log "killing mypage"
-	while pid=$(pgrep S99mypage | head -1) && [[ $pid ]]; do
-		shutdown_log "killing mypage process group, pid: $pid"
-		pgid=$(ps x -o "%p %r" | egrep "\s*$pid\s+[0-9]+" | sed -E 's/^\s*[0-9]+\s*//')
-		kill -- "-$pgid"
-	done
-	shutdown_log "some partitions weren't unmounted by automount, running shutdown_sh.sh to unmount partitions"
-	#switch shell to /bin/sh as bash has handles using /opt
-	#	can't remount /opt as read-only, as partitions can't unmount normally even if mounted read-only
-	#	can't copy bash to /tmp as it might have unknown lib dependencies (dlopen/dlsym, equivalent of GetProcAddress)
-	#	the file lock is still kept after switching to /bin/sh
-	exec /bin/sh "/jffs/etc/config/shutdown/shutdown_sh.sh" $flash_pid
 }
 
-function shutdown_main(){
-	trap "event_wait_cleanup $SHUTDOWN_EVENT; exit 1;" INT TERM
-	#run init.d stop script, this handles unmounting of both /mnt and /opt
-	shutdown_log "shutting down optware"
-	shutdown_optware_signal &
-	#wait for the shutdown script to finish, and flash led's while doing so, to show that the script is working
-	#	sh is used so that the process can be killed when switching to /bin/sh
-	#	the feedback parameters are escaped with '$'
-	/bin/sh -c "
-		. /jffs/etc/config/lib/led.sh
-		flash_led -1 $LED_OFF $LED_ON
-	" &
-	flash_pid=$!
-	trap "event_wait_cleanup $SHUTDOWN_EVENT; shutdown_fail $flash_pid;" INT TERM
-	if ! event_wait $MAX_WAIT_INTERVAL $SHUTDOWN_EVENT; then
-		#optware shutdown timed out
-		shutdown_log "optware shutdown timed out"
-		event_wait_cleanup $SHUTDOWN_EVENT
-		shutdown_fail $flash_pid
-	fi
-	trap "shutdown_fail $flash_pid;" INT TERM
-	shutdown_log "optware shutdown completed"
-	shutdown_log "checking if partitions are still mounted (automount doesn't unmount /opt)"
-	#try to unmount partitions if still mounted
-	shutdown_unmount
-	#control not transferred to sh, hence all partitions are unmounted
-	shutdown_log "partitions already unmounted by automount"
-	shutdown_success $flash_pid
-}
-
-function main(){
+main(){
+	#if multiple processes use the critical section, SHUTDOWN_STAGE ensures that they run in sequence
 	rm $LOCK_PATH
 	flock -x $LOCK_FILE
 	shutdown_main
-	flock -u $LOCK_FILE
+	local res=$?
+	exit $res
 }
 
 main

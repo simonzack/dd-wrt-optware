@@ -142,8 +142,8 @@ case $cur_count in
 	"1") $log "running command: shutdown"
 		( sync; exec /opt/jffs/etc/config/shutdown/shutdown.sh) &
 		;;
-	"2") $log "running command: reboot (/sbin/reboot)"
-		( sync; exec /sbin/reboot) &
+	"2") $log "running command: reboot"
+		( sync; exec /opt/jffs/etc/config/shutdown/reboot.sh) &
 		;;
 	"3") $log "running command: nop (cancel previous clicks)"
 		;;

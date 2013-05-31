@@ -46,10 +46,10 @@ if ! cat /proc/mounts | egrep -q "^/dev/discs/.+/jffs"; then
 fi
 
 #disable swap on flash-based devices
-enableSwap=false
+enableSwap=0
 
 #use the existing S10swap service to find & mount all available swap partitions, or a custom swap file
-if [[ $enableSwap == true ]]; then
+if (( $enableSwap )); then
 	#a high swappiness value will slow down the router due to caches not being freed fast enough
 	echo "0" > /proc/sys/vm/swappiness
 	initCtl enable swap
@@ -62,6 +62,17 @@ echo "16384" > /proc/sys/net/ipv4/netfilter/ip_conntrack_max
 #conntrack hashtable size
 echo "16384" > /sys/module/nf_conntrack/parameters/hashsize
 
+#check if dbus is not running due to avahi
+if ! pgrep dbus-daemon && which avahi-daemon; then
+	#avahi's dbus configuration needs the 'netdev' group, so that the following works
+	#	$ service start dbus
+	#this can't go into the dbus init.d's config file, as it gets executed at both 'service dbus start' and 'service dbus stop'
+	addgroup netdev
+	rm /opt/var/run/dbus/pid
+	service dbus start
+fi
 
-cd /jffs/etc/config
-./cleanupNVRam.sh
+#use /opt so shutdown can run faster during startup, as it needs to umount /jffs
+cd /opt/jffs/etc/config
+./cleanupNVRam.sh &
+

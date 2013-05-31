@@ -1,26 +1,23 @@
 #!/bin/sh
 
-. /jffs/etc/config/lib/led.sh
+#this file should have no imports, as it is loaded both before and after remounts
+
+SHUTDOWN_LOG_PATH=/var/log/shutdown
+
+shutdown_log_raw(){
+	echo "$@"
+	echo "$@" >> $SHUTDOWN_LOG_PATH
+}
 
 shutdown_log(){
 	#don't use logger, otherwise only parts of the shutdown log will be present in /opt, which will be confusing
 	echo "$@"
-	echo $(/bin/date +"%Y %b %e %X") $(/bin/hostname) "optware unmount shutdown ($$): " "$@" >> /var/log/shutdown
+	echo $(/bin/date +"%Y %b %e %X") $(/bin/hostname) "optware unmount shutdown ($$): " "$@" >> $SHUTDOWN_LOG_PATH
 }
 
-shutdown_success(){
-	#switch off power led to show the script has finished (it's not switched off by just killing $flash_pid)
-	shutdown_log "successfully shutdown"
-	local flash_pid=$1; shift
-	kill $flash_pid
-	led_off
-	exit 0
-}
-
-shutdown_fail(){
-	shutdown_log "failed to shutdown"
-	local flash_pid=$1; shift
-	kill $flash_pid
-	led_on
-	exit 1
+shutdown_log_unmount_fail(){
+	local dir=$1; shift
+	shutdown_log "failed to unmount $dir"
+	shutdown_log "$ lsof $dir"
+	shutdown_log_raw "$(lsof $dir)"
 }
